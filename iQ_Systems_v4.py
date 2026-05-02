@@ -572,6 +572,10 @@ def _rmt_start_server(port=5050):
     def _health():
         return _jsonify({"status":"ok"})
 
+    @_app.route("/")
+    def _index():
+        return _jsonify({"status":"ok","service":"iQ Remote Marks Server"})
+
     def _run():
         import logging; logging.getLogger("werkzeug").setLevel(logging.ERROR)
         while True:
@@ -613,7 +617,10 @@ def _cloud_pull_new(cloud_url: str, cloud_token: str) -> dict:
     """Pull marks submitted by teachers via the cloud portal into local DB.
     Returns {"pulled": N, "errors": [...]}
     """
-    import requests as _req
+    try:
+        import requests as _req
+    except ImportError:
+        return {"pulled": 0, "errors": ["requests library not installed. Run: pip install requests"]}
     try:
         last_sync = _cloud_get_last_sync_ts()
         r = _req.get(
@@ -779,13 +786,21 @@ def _rmt_get_db_path() -> str:
 
 def _cloud_ping(cloud_url: str, token: str) -> bool:
     """Return True if the cloud server is reachable and token is valid."""
+    url = f"{cloud_url.rstrip('/')}/health"
     try:
         import requests as _req
-        r = _req.get(
-            f"{cloud_url.rstrip('/')}/health",
-            params={"token": token}, timeout=8
-        )
+        r = _req.get(url, timeout=15)  # /health needs no token
         return r.status_code == 200
+    except ImportError:
+        pass
+    except Exception:
+        return False
+    # Fallback: urllib (always available)
+    try:
+        import urllib.request as _ur, urllib.parse as _up
+        full = url  # /health needs no token
+        with _ur.urlopen(full, timeout=15) as resp:
+            return resp.status == 200
     except Exception:
         return False
 
@@ -19633,9 +19648,15 @@ def _build_cloud_app():
 
     @app.route("/health")
     def health():
+        # No auth required — used for liveness checks
         return jsonify({"status": "ok", "server": "iQ Cloud Marks Server",
                         "db": "postgresql" if USE_POSTGRES else "sqlite",
                         "token_required": bool(ADMIN_TOKEN)})
+
+    @app.route("/")
+    def index():
+        return jsonify({"status": "ok", "service": "iQ Cloud Marks Server",
+                        "message": "Server is running. Use the iQ desktop app to connect."})
 
     @app.route("/enter/<section>")
     def teacher_ui(section):
