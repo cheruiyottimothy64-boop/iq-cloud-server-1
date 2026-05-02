@@ -804,12 +804,17 @@ def _cloud_ping(cloud_url: str, token: str) -> bool:
     except Exception:
         return False
 
-def _cloud_push_schema(cloud_url: str, token: str) -> dict:
-    """Upload local classes, learners, subjects to cloud so teachers see real data.
-    Call once after first deploy, and after adding new classes/learners.
+def _cloud_push_schema(cloud_url: str, token: str, progress_cb=None) -> dict:
+    """Upload local classes, learners, subjects to cloud in batches.
+    progress_cb(msg) called with status updates if provided.
     Returns {"ok": bool, "classes": N, "subjects": N, "learners": N, "error": str}
     """
     import requests as _req
+    base = cloud_url.rstrip("/")
+
+    def _cb(msg):
+        if progress_cb: progress_cb(msg)
+
     try:
         DB   = _rmt_get_db_path()
         conn = sqlite3.connect(DB); conn.row_factory = sqlite3.Row
@@ -817,40 +822,61 @@ def _cloud_push_schema(cloud_url: str, token: str) -> dict:
         classes = [dict(r) for r in conn.execute(
             "SELECT id,name,grade FROM classes ORDER BY name"
         ).fetchall()]
-
         subjects = [dict(r) for r in conn.execute(
             "SELECT id,code,name,max_marks,section_key,sort_order,is_active "
             "FROM subjects ORDER BY sort_order,name"
         ).fetchall()]
-
         learners = [dict(r) for r in conn.execute(
             "SELECT id,admission_no,first_name,last_name,class_id "
             "FROM learners WHERE status='Active' ORDER BY first_name,last_name"
         ).fetchall()]
-
         try:
             cfg_row = conn.execute("SELECT value FROM iq_meta WHERE key='cbc_levels'").fetchone()
             cbc_levels = json.loads(cfg_row["value"]) if cfg_row else []
         except Exception:
             cbc_levels = []
-
-        school_name = CFG.get("school_name","iQ School")
+        school_name = CFG.get("school_name", "iQ School")
         conn.close()
 
-        payload = {
-            "token":      token,
-            "school":     {"name": school_name, "config": {}},
+        # ── Step 1: Wake server (free tier sleeps after inactivity) ──
+        _cb("⏳ Waking cloud server...")
+        try:
+            _req.get(f"{base}/health", timeout=30)
+        except Exception:
+            pass
+
+        # ── Step 2: Upload school info, classes, subjects ────────────
+        _cb(f"📤 Uploading {len(classes)} classes & {len(subjects)} subjects...")
+        r = _req.post(f"{base}/api/sync/schema", json={
+            "token": token,
+            "school": {"name": school_name, "config": {}},
             "cbc_levels": cbc_levels,
-            "classes":    classes,
-            "subjects":   subjects,
-            "learners":   learners,
-        }
-        r = _req.post(
-            f"{cloud_url.rstrip('/')}/api/sync/schema",
-            json=payload, timeout=60
-        )
+            "classes":  classes,
+            "subjects": subjects,
+            "learners": [],   # learners sent separately in batches
+        }, timeout=60)
         r.raise_for_status()
-        return r.json()
+
+        # ── Step 3: Upload learners in batches of 100 ────────────────
+        BATCH = 100
+        total_saved = 0
+        for i in range(0, len(learners), BATCH):
+            batch = learners[i:i+BATCH]
+            done  = min(i+BATCH, len(learners))
+            _cb(f"👥 Uploading learners {i+1}–{done} of {len(learners)}...")
+            rb = _req.post(f"{base}/api/sync/schema", json={
+                "token":    token,
+                "classes":  [],
+                "subjects": [],
+                "learners": batch,
+            }, timeout=60)
+            rb.raise_for_status()
+            total_saved += len(batch)
+
+        _cb(f"✅ Done! {len(classes)} classes · {len(subjects)} subjects · {total_saved} learners uploaded.")
+        return {"ok": True, "classes": len(classes),
+                "subjects": len(subjects), "learners": total_saved}
+
     except Exception as ex:
         return {"ok": False, "error": str(ex)}
 
@@ -8811,10 +8837,12 @@ class SectionPanel(tk.Frame):
                 curl = _RMT_CLOUD_URL; ctok = _RMT_CLOUD_TOKEN
                 if not curl:
                     cloud_status.configure(text="❌  Connect to cloud server first.", fg=T("RED")); return
-                cloud_status.configure(text="⏳ Uploading classes, subjects and learners to cloud…", fg=T("SUBTEXT"))
+                cloud_status.configure(text="⏳ Waking cloud server (may take 30s on free tier)…", fg=T("SUBTEXT"))
                 dlg.update_idletasks()
+                def _progress(msg):
+                    dlg.after(0, lambda m=msg: cloud_status.configure(text=m, fg=T("SUBTEXT")))
                 def _do():
-                    result = _cloud_push_schema(curl, ctok)
+                    result = _cloud_push_schema(curl, ctok, progress_cb=_progress)
                     if result.get("ok"):
                         msg = (f"✅  Schema uploaded successfully!\n"
                                f"    Classes: {result.get('classes',0)}  "
