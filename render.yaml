@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: iQ-Cloud-Marks-Server
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn "iQ_Systems_v4:_build_cloud_app()" --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+    envVars:
+      - key: IQ_ADMIN_TOKEN
+        generateValue: true
+      - key: DB_PATH
+        value: /data/iq_cloud.db
+    disk:
+      name: iq-data
+      mountPath: /data
+      sizeGB: 1
