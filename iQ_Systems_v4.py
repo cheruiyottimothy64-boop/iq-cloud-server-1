@@ -592,27 +592,62 @@ def _rmt_start_server(port=5050):
 # CLOUD SYNC API — push/pull marks between desktop DB and cloud server
 # ══════════════════════════════════════════════════════════════════════════════
 def _cloud_push_pending(cloud_url: str, cloud_token: str) -> dict:
-    """Push locally-pending marks to the cloud server.
-    Returns {"pushed": N, "errors": [...]}
-    """
-    import requests as _req
-    pending = _cloud_get_pending_local()
-    if not pending:
-        return {"pushed": 0, "errors": []}
+    """Push ALL local marks to cloud. No sync_status column required."""
+    base = cloud_url.rstrip("/")
     try:
-        r = _req.post(
-            f"{cloud_url.rstrip('/')}/api/sync/push",
-            json={"token": cloud_token, "records": pending},
-            timeout=30
-        )
-        r.raise_for_status()
-        data = r.json()
-        if data.get("ok"):
-            _cloud_mark_synced_local([rec["local_id"] for rec in pending])
-        return {"pushed": data.get("saved", 0), "errors": data.get("errors", [])}
+        import urllib.request as _ur, urllib.parse as _up
+        def _post(url, data, timeout=45):
+            body = json.dumps(data).encode()
+            req  = _ur.Request(url, data=body, headers={"Content-Type":"application/json"})
+            with _ur.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode())
+    except Exception:
+        return {"pushed": 0, "errors": ["urllib not available"]}
+
+    try:
+        db_path = _rmt_get_db_path()
+        conn = sqlite3.connect(db_path); conn.row_factory = sqlite3.Row
+
+        # Get ALL results — no sync_status filter
+        rows = conn.execute("""
+            SELECT r.rowid as local_id, r.learner_id, r.assessment_id,
+                   r.marks, r.performance_level, r.points, r.is_absent,
+                   a.class_id, a.subject_id, a.term, a.academic_year,
+                   a.type as atype, a.max_marks,
+                   l.admission_no, l.first_name, l.last_name,
+                   s.code as subject_code, s.name as subject_name,
+                   s.max_marks as s_max_marks,
+                   c.name as class_name, c.grade
+            FROM results r
+            JOIN assessments a ON a.id = r.assessment_id
+            JOIN learners   l ON l.id = r.learner_id
+            JOIN subjects   s ON s.id = a.subject_id
+            JOIN classes    c ON c.id = a.class_id
+            LIMIT 2000
+        """).fetchall()
+        conn.close()
+
+        if not rows:
+            return {"pushed": 0, "errors": []}
+
+        records = [dict(r) for r in rows]
+        # Send in batches of 200
+        total_pushed = 0
+        errors = []
+        for i in range(0, len(records), 200):
+            batch = records[i:i+200]
+            try:
+                result = _post(f"{base}/api/sync/push",
+                               {"token": cloud_token, "records": batch},
+                               timeout=60)
+                total_pushed += result.get("saved", 0)
+            except Exception as ex:
+                errors.append(str(ex))
+
+        return {"pushed": total_pushed, "errors": errors}
+
     except Exception as ex:
         return {"pushed": 0, "errors": [str(ex)]}
-
 def _cloud_pull_new(cloud_url: str, cloud_token: str) -> dict:
     """Pull marks submitted by teachers via the cloud portal into local DB.
     Returns {"pulled": N, "errors": [...]}
@@ -638,34 +673,40 @@ def _cloud_pull_new(cloud_url: str, cloud_token: str) -> dict:
         return {"pulled": 0, "errors": [str(ex)]}
 
 def _cloud_get_pending_local() -> list:
-    """Return local marks not yet synced to cloud (sync_status='pending')."""
+    """Return ALL local marks not yet confirmed synced to cloud."""
     try:
         DB = _rmt_get_db_path()
         conn = sqlite3.connect(DB); conn.row_factory = sqlite3.Row
-        # Ensure sync columns exist
+        # Ensure sync column exists — if ALTER fails, column already exists
         try:
             conn.execute("ALTER TABLE results ADD COLUMN sync_status TEXT DEFAULT 'local'")
             conn.execute("ALTER TABLE results ADD COLUMN cloud_id INTEGER")
+            conn.commit()
+        except Exception: pass
+        # Mark ALL existing NULL rows as 'local' so they get picked up
+        try:
+            conn.execute("UPDATE results SET sync_status='local' WHERE sync_status IS NULL OR sync_status=''")
             conn.commit()
         except Exception: pass
         rows = conn.execute(
             "SELECT r.rowid as local_id, r.learner_id, r.assessment_id, "
             "r.marks, r.performance_level, r.points, r.is_absent, r.entry_date, "
             "a.class_id, a.subject_id, a.term, a.academic_year, a.type as atype, "
+            "a.max_marks, "
             "l.admission_no, l.first_name, l.last_name, "
-            "s.code as subject_code, s.name as subject_name, s.max_marks, "
+            "s.code as subject_code, s.name as subject_name, s.max_marks as s_max_marks, "
             "c.name as class_name, c.grade "
             "FROM results r "
             "JOIN assessments a ON a.id=r.assessment_id "
             "JOIN learners l ON l.id=r.learner_id "
             "JOIN subjects s ON s.id=a.subject_id "
             "JOIN classes c ON c.id=a.class_id "
-            "WHERE (r.sync_status IS NULL OR r.sync_status='pending') "
-            "LIMIT 500"
+            "WHERE (r.sync_status IS NULL OR r.sync_status NOT IN ('synced')) "
+            "LIMIT 1000"
         ).fetchall()
         conn.close()
         return [dict(r) for r in rows]
-    except Exception:
+    except Exception as e:
         return []
 
 def _cloud_mark_synced_local(local_ids: list):
@@ -781,8 +822,58 @@ def _cloud_save_sync_ts():
     except Exception: pass
 
 def _rmt_get_db_path() -> str:
-    base = _pathlib.Path(__file__).parent
-    return str(base / "ems_iq.db")
+    """Find ems_iq.db — checks multiple locations, returns the largest (most data)."""
+    import sys as _sys, os as _os
+
+    # All candidate locations to search
+    candidates = []
+
+    # 1. KNOWN INSTALL LOCATION (highest priority)
+    candidates.append(_pathlib.Path(r"C:/Users/iQTim/Desktop/IQ REMOTE/ems_iq.db"))
+    candidates.append(_pathlib.Path(r"C:/Users/iQTim/Desktop/ems_iq.db"))
+
+    # 2. Saved path in config file
+    try:
+        cfg_file = _pathlib.Path(_sys.executable).parent / "iq_config.json" if getattr(_sys,"frozen",False) else _pathlib.Path(__file__).parent / "iq_config.json"
+        if cfg_file.exists():
+            import json as _j
+            _cfg = _j.loads(cfg_file.read_text(encoding="utf-8"))
+            if _cfg.get("db_path"):
+                candidates.insert(0, _pathlib.Path(_cfg["db_path"]))
+    except Exception:
+        pass
+
+    # 3. Next to EXE (PyInstaller)
+    if getattr(_sys, "frozen", False):
+        candidates.append(_pathlib.Path(_sys.executable).parent / "ems_iq.db")
+
+    # 4. Next to script
+    try:
+        candidates.append(_pathlib.Path(__file__).parent / "ems_iq.db")
+    except Exception:
+        pass
+
+    # 5. Other common locations
+    for _base in [
+        _pathlib.Path.home() / "Desktop",
+        _pathlib.Path.home() / "iQ_EMS",
+        _pathlib.Path.home() / "Desktop" / "iQ_EMS",
+        _pathlib.Path("C:/iQ_EMS"),
+        _pathlib.Path("C:/Users") / _os.environ.get("USERNAME","") / "Desktop",
+        _pathlib.Path("C:/Users") / _os.environ.get("USERNAME","") / "Documents",
+    ]:
+        candidates.append(_base / "ems_iq.db")
+
+    # Return the existing file with the most data (largest size)
+    existing = [(p.stat().st_size, p) for p in candidates if p.exists()]
+    if existing:
+        existing.sort(reverse=True)
+        return str(existing[0][1])
+
+    # Fallback: next to script/exe
+    if getattr(_sys, "frozen", False):
+        return str(_pathlib.Path(_sys.executable).parent / "ems_iq.db")
+    return str(_pathlib.Path(__file__).parent / "ems_iq.db")
 
 def _cloud_ping(cloud_url: str, token: str) -> bool:
     """Return True if the cloud server is reachable and token is valid."""
@@ -809,8 +900,25 @@ def _cloud_push_schema(cloud_url: str, token: str, progress_cb=None) -> dict:
     progress_cb(msg) called with status updates if provided.
     Returns {"ok": bool, "classes": N, "subjects": N, "learners": N, "error": str}
     """
-    import requests as _req
     base = cloud_url.rstrip("/")
+    # Use requests if available, else fall back to urllib (always available)
+    try:
+        import requests as _req
+        def _post(url, data, timeout=45):
+            r = _req.post(url, json=data, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        def _get(url, timeout=30):
+            return _req.get(url, timeout=timeout)
+    except ImportError:
+        import urllib.request as _ur, urllib.parse as _up
+        def _post(url, data, timeout=45):
+            body = json.dumps(data).encode()
+            req  = _ur.Request(url, data=body, headers={"Content-Type":"application/json"})
+            with _ur.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode())
+        def _get(url, timeout=30):
+            return _ur.urlopen(url, timeout=timeout)
 
     def _cb(msg):
         if progress_cb: progress_cb(msg)
@@ -841,21 +949,27 @@ def _cloud_push_schema(cloud_url: str, token: str, progress_cb=None) -> dict:
         # ── Step 1: Wake server (free tier sleeps after inactivity) ──
         _cb("⏳ Waking cloud server...")
         try:
-            _req.get(f"{base}/health", timeout=30)
+            _get(f"{base}/health", timeout=30)
         except Exception:
             pass
 
+        # ── Step 1b: Wipe old cloud data so deleted classes don't reappear ──
+        _cb("🗑️ Clearing old cloud data...")
+        try:
+            _post(f"{base}/api/sync/reset", {"token": token}, timeout=30)
+        except Exception:
+            pass  # If reset endpoint not yet deployed, skip
+
         # ── Step 2: Upload school info, classes, subjects ────────────
         _cb(f"📤 Uploading {len(classes)} classes & {len(subjects)} subjects...")
-        r = _req.post(f"{base}/api/sync/schema", json={
+        _post(f"{base}/api/sync/schema", {
             "token": token,
             "school": {"name": school_name, "config": {}},
             "cbc_levels": cbc_levels,
             "classes":  classes,
             "subjects": subjects,
-            "learners": [],   # learners sent separately in batches
+            "learners": [],
         }, timeout=60)
-        r.raise_for_status()
 
         # ── Step 3: Upload learners in batches of 100 ────────────────
         BATCH = 100
@@ -864,13 +978,12 @@ def _cloud_push_schema(cloud_url: str, token: str, progress_cb=None) -> dict:
             batch = learners[i:i+BATCH]
             done  = min(i+BATCH, len(learners))
             _cb(f"👥 Uploading learners {i+1}–{done} of {len(learners)}...")
-            rb = _req.post(f"{base}/api/sync/schema", json={
+            _post(f"{base}/api/sync/schema", {
                 "token":    token,
                 "classes":  [],
                 "subjects": [],
                 "learners": batch,
             }, timeout=60)
-            rb.raise_for_status()
             total_saved += len(batch)
 
         _cb(f"✅ Done! {len(classes)} classes · {len(subjects)} subjects · {total_saved} learners uploaded.")
@@ -8761,6 +8874,38 @@ class SectionPanel(tk.Frame):
 
             # Cloud action buttons
             cbtns = tk.Frame(cloud_tab, bg=T("BG")); cbtns.pack(anchor="w", padx=14, pady=4)
+
+            # Show DB diagnostics
+            def _show_db_info():
+                import os as _os2, sqlite3 as _sq
+                db_path = _rmt_get_db_path()
+                db_exists = _os2.path.exists(db_path)
+                db_size   = _os2.path.getsize(db_path) if db_exists else 0
+                msg = f"📂 DB: {db_path}\n   Exists: {db_exists}  Size: {db_size:,} bytes\n"
+                if db_exists:
+                    try:
+                        c = _sq.connect(db_path); c.row_factory = _sq.Row
+                        tables = [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+                        msg += f"   Tables: {', '.join(tables)}\n"
+                        if 'results' in tables:
+                            n = c.execute("SELECT COUNT(*) FROM results").fetchone()[0]
+                            msg += f"   Results rows: {n}\n"
+                        if 'classes' in tables:
+                            n = c.execute("SELECT COUNT(*) FROM classes").fetchone()[0]
+                            msg += f"   Classes: {n}\n"
+                        if 'learners' in tables:
+                            n = c.execute("SELECT COUNT(*) FROM learners WHERE status='Active'").fetchone()[0]
+                            msg += f"   Active learners: {n}\n"
+                        if 'sync_status' not in [r[1] for r in c.execute("PRAGMA table_info(results)").fetchall()]:
+                            msg += "   ⚠ sync_status column MISSING from results table\n"
+                        else:
+                            sc = dict(c.execute("SELECT sync_status, COUNT(*) FROM results GROUP BY sync_status").fetchall())
+                            msg += f"   Sync status breakdown: {sc}\n"
+                        c.close()
+                    except Exception as ex:
+                        msg += f"   ❌ DB read error: {ex}\n"
+                cloud_status.configure(text=msg, fg=T("SUBTEXT"))
+            _show_db_info()
 
             def _cloud_connect():
                 global _RMT_CLOUD_URL, _RMT_CLOUD_TOKEN
@@ -19941,6 +20086,20 @@ def _build_cloud_app():
                 log.warning(f"push row error: {e}")
                 errors += 1
         return jsonify({"ok": True, "saved": saved, "errors": errors})
+
+    @app.route("/api/sync/reset", methods=["POST"])
+    @require_token
+    def sync_reset():
+        """Wipe all classes, learners, subjects, assessments and results from cloud DB."""
+        try:
+            for tbl in ("cloud_results","cloud_assessments","cloud_learners",
+                        "cloud_subjects","cloud_classes","cloud_school"):
+                try: _exec(f"DELETE FROM {tbl}")
+                except Exception: pass
+            _commit()
+            return jsonify({"ok": True, "message": "Cloud DB wiped successfully"})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
 
     @app.route("/api/sync/schema", methods=["POST"])
     @require_token
