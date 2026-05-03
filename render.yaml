@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: iq-cloud-server
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn iQ_Cloud_Server:app --bind 0.0.0.0:$PORT --workers 1 --timeout 120
+    envVars:
+      - key: IQ_ADMIN_TOKEN
+        sync: false          # You set this manually in Render dashboard
+    disk:
+      name: iq-data
+      mountPath: /data
+      sizeGB: 1              # Free persistent disk for SQLite
